@@ -1,0 +1,156 @@
+"""
+nw_main2.py — PATCHED
+=====================
+Changes from original nw_main2.py:
+
+1. ProjectJobIn now accepts `headcount` (default 1)
+2. create_project uses headcount from request
+3. manual-swap now computes real score via SearchService (no more 0%)
+4. _assignment_to_match unchanged (already correct)
+
+Apply these diffs to your nw_main2.py:
+"""
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# DIFF 1: ProjectJobIn — add headcount field
+# ═══════════════════════════════════════════════════════════════════════════════
+# REPLACE (around line 196-202):
+#
+#   class ProjectJobIn(BaseModel):
+#       title: str
+#
+#       @field_validator("title")
+#       @classmethod
+#       def _clean(cls, v: str) -> str:
+#           return sanitize_string(v, 200)
+#
+# WITH:
+
+class ProjectJobIn(BaseModel):
+    title: str
+    headcount: int = 1
+
+    @field_validator("title")
+    @classmethod
+    def _clean(cls, v: str) -> str:
+        return sanitize_string(v, 200)
+
+    @field_validator("headcount")
+    @classmethod
+    def _valid_headcount(cls, v: int) -> int:
+        if v < 1:
+            raise ValueError("headcount must be >= 1")
+        return min(v, 50)  # cap at 50
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# DIFF 2: create_project — use headcount from request
+# ═══════════════════════════════════════════════════════════════════════════════
+# REPLACE the job creation loop inside create_project (around line 737-746):
+#
+#     for idx, job_in in enumerate(body.jobs):
+#         j_slug = _re.sub(r"[^a-z0-9]+", "_", job_in.title.lower()).strip("_")
+#         job_id = f"{project_id}_{j_slug}_{idx}"
+#         _db.upsert_job(
+#             job_id=job_id, project_id=project_id, title=job_in.title,
+#             description="", headcount=1, required_stack=[], responsibilities=[],
+#             seniority="mid", job_type="full-time", estimated_duration_months=6,
+#         )
+#         _db.add_job_to_project(project_id, job_id)
+#         job_ids.append(job_id)
+#
+# WITH:
+
+    for idx, job_in in enumerate(body.jobs):
+        j_slug = _re.sub(r"[^a-z0-9]+", "_", job_in.title.lower()).strip("_")
+        job_id = f"{project_id}_{j_slug}_{idx}"
+        _db.upsert_job(
+            job_id=job_id, project_id=project_id, title=job_in.title,
+            description="", headcount=job_in.headcount, required_stack=[],
+            responsibilities=[], seniority="mid", job_type="full-time",
+            estimated_duration_months=6,
+        )
+        _db.add_job_to_project(project_id, job_id)
+        job_ids.append(job_id)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# DIFF 3: manual-swap — compute real score via SearchService
+# ═══════════════════════════════════════════════════════════════════════════════
+# REPLACE the manual_swap endpoint (around line 1029-1063):
+#
+# The old code creates assignment with notes="" and returns raw score (usually 0).
+# The new code scores the employee using SearchService + generates explanation.
+#
+# WITH:
+
+@app.post("/api/v1/matches/manual-swap", tags=["Matches"], status_code=201)
+async def manual_swap(body: ManualSwapRequest, current_user: dict = Depends(_require_po_or_admin)):
+    project_id      = sanitize_string(body.project_id, 100)
+    job_id          = sanitize_string(body.job_id, 100)
+    new_employee_id = sanitize_string(body.new_employee_id, 254)
+    check_nosql_injection({"new_employee_id": new_employee_id})
+
+    old_match_rejected = False
+    if body.old_match_id:
+        old_match_id = sanitize_string(body.old_match_id, 100)
+        old_asgn = _db.get_assignment(old_match_id)
+        if old_asgn:
+            try:
+                if old_asgn["status"] == "accepted":
+                    _db.unassign_employee(old_match_id, reason="Replaced via manual swap.")
+                elif old_asgn["status"] == "pending":
+                    _db.reject_assignment(old_match_id, reason="Replaced via manual swap.")
+                old_match_rejected = True
+            except ValueError:
+                pass
+
+    try:
+        new_asgn = _db.create_assignment(
+            employee_id=new_employee_id, project_id=project_id, job_id=job_id,
+            assigned_by=current_user.get("sub", "system"),
+            notes="Manually swapped via UI",
+        )
+
+        # ── Compute real score via SearchService ──────────────────────────
+        try:
+            search_svc = SearchService()
+            scored = search_svc.search_employees_for_job(job_id, project_id, limit=200)
+            emp_score_data = next(
+                (r for r in scored if r["employee_id"] == new_employee_id), None
+            )
+            actual_score   = emp_score_data["matching_score"] if emp_score_data else 0.0
+            matched_skills = emp_score_data.get("matched_skills", []) if emp_score_data else []
+            missing_skills = emp_score_data.get("missing_skills", []) if emp_score_data else []
+        except Exception:
+            actual_score   = 0.0
+            matched_skills = []
+            missing_skills = []
+
+        explanation = ""
+        try:
+            explanation = explain_assignment(
+                job_id, new_employee_id, project_id, actual_score,
+                matched_skills, missing_skills,
+            )
+        except Exception:
+            explanation = f"Match score: {round(actual_score * 100)}/100."
+
+        _db.assignments.update_one(
+            {"_id": new_asgn["_id"]},
+            {"$set": {"explanation": explanation, "adequacy_score": actual_score}}
+        )
+
+        new_match = _assignment_to_match(_serialize(new_asgn))
+        new_match["explanation"]     = explanation
+        new_match["scorePercentage"] = round(actual_score * 100)
+        new_match["matchScore"]      = actual_score
+        new_match["matched_skills"]  = matched_skills
+        new_match["missing_skills"]  = missing_skills
+
+        emp_doc = _db.employees.find_one({"_id": new_employee_id}, {"name": 1})
+        new_match["employeeName"] = emp_doc.get("name", new_employee_id) if emp_doc else new_employee_id
+
+        return {"old_match_rejected": old_match_rejected, "new_match": new_match}
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))

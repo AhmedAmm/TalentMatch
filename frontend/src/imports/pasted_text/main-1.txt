@@ -1,0 +1,1602 @@
+"""
+main.py
+-------
+SmartStaff FastAPI backend — single entry point.
+
+Endpoints (base: /api/v1)
+--------------------------
+AUTH
+  POST   /auth/login
+  POST   /auth/register
+
+USERS
+  GET    /users
+  POST   /users
+  DELETE /users/{user_id}
+
+EMPLOYEES
+  GET    /employees
+  GET    /employees/{employee_id}
+  POST   /employees/import-cv          (multipart PDF + email)
+  GET    /employees/{employee_id}/generate-cv
+
+PROJECTS
+  GET    /projects
+  GET    /projects/{project_id}
+  POST   /projects                     (triggers smart matching)
+  PATCH  /projects/{project_id}/status
+
+MATCHES
+  GET    /projects/{project_id}/matches
+  PATCH  /matches/{match_id}/status
+  POST   /matches/{match_id}/reject-next
+  POST   /matches/{match_id}/unassign
+  POST   /projects/{project_id}/jobs/{job_id}/swap
+
+Run:
+    uvicorn main:app --reload --port 8000
+"""
+
+from __future__ import annotations
+
+import io
+import os
+import sys
+import tempfile
+import logging
+from pathlib import Path
+from typing import Any, Optional
+
+from dotenv import load_dotenv
+
+load_dotenv()
+
+# ── Sys-path setup (must happen before any local imports) ─────────────────────
+_ROOT  = os.path.dirname(os.path.abspath(__file__))
+_TOOLS = os.path.join(_ROOT, "tools")
+_MP    = os.path.join(_ROOT, "matching_pipeline")
+_MPC   = os.path.join(_MP, "core")
+_CVG   = os.path.join(_ROOT, "cv_generation")
+_POP   = os.path.join(_ROOT, "po_parser")
+
+for _p in [_ROOT, _TOOLS, _MP, _MPC, _CVG, _POP]:
+    if _p not in sys.path:
+        sys.path.insert(0, _p)
+
+# ── FastAPI imports ────────────────────────────────────────────────────────────
+from fastapi import (
+    Depends, FastAPI, File, Form, Header, HTTPException,
+    Request, UploadFile, BackgroundTasks,
+)
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
+from pydantic import BaseModel, EmailStr, Field, field_validator
+
+# ── Local imports ─────────────────────────────────────────────────────────────
+from tools.security import (
+    SecurityMiddleware,
+    check_nosql_injection,
+    sanitize_dict,
+    sanitize_string,
+    validate_email_field,
+    validate_pdf_upload,
+    verify_turnstile,
+)
+import tools.auth as _auth
+import tools.db   as _db
+from matching_pipeline.core.search_service import SearchService
+from matching_pipeline.core.explain_helper import explain_assignment
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("main")
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  APP SETUP
+# ═══════════════════════════════════════════════════════════════════════════════
+
+app = FastAPI(
+    title="SmartStaff API",
+    version="1.0.0",
+    description="AI-powered employee matching & CV generation platform.",
+    docs_url="/docs",
+    redoc_url="/redoc",
+)
+
+# ── CORS ───────────────────────────────────────────────────────────────────────
+_ALLOWED_ORIGINS = [o.strip() for o in os.getenv("CORS_ORIGINS", "http://localhost:3000,http://localhost:5173").split(",") if o.strip()]
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=_ALLOWED_ORIGINS,
+    allow_credentials=True,
+    allow_methods=["GET", "POST", "PATCH", "DELETE", "OPTIONS"],
+    allow_headers=["Authorization", "Content-Type", "CF-Turnstile-Token"],
+)
+
+# ── Security middleware (rate limiting, headers, URL injection guard) ─────────
+#app.add_middleware(SecurityMiddleware)
+
+# ── Session cache for matching pipeline ──────────────────────────────────────
+_cached_session: dict = {}  # {project_id: Session}
+
+
+def _get_session(project_id: str):
+    if project_id not in _cached_session:
+        from matching_pipeline.pipeline import Session, load_jobs_from_mongo, load_employee_constraints
+        jobs = load_jobs_from_mongo(project_id)
+        available_emails, exclusion_map = load_employee_constraints(list(jobs.keys()))
+        _cached_session[project_id] = Session(jobs, available_emails, exclusion_map)
+    return _cached_session[project_id]
+
+
+def _clear_session(project_id: str):
+    _cached_session.pop(project_id, None)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  AUTH DEPENDENCY
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def _get_current_user(authorization: str = Header(default="")) -> dict:
+    """Extract and verify the JWT Bearer token from the Authorization header."""
+    if not authorization.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="Missing or invalid Authorization header.")
+    token = authorization[len("Bearer "):]
+    try:
+        return _auth.verify_token(token)
+    except _auth.AuthError as exc:
+        raise HTTPException(status_code=401, detail=str(exc))
+
+
+def _require_admin(current_user: dict = Depends(_get_current_user)) -> dict:
+    if not current_user.get("is_sys_admin") and current_user.get("role") not in ("ADMIN", "RH"):
+        raise HTTPException(status_code=403, detail="Admin or RH role required.")
+    return current_user
+
+
+def _require_po_or_admin(current_user: dict = Depends(_get_current_user)) -> dict:
+    if current_user.get("role") not in ("ADMIN", "PO", "RH") and not current_user.get("is_sys_admin"):
+        raise HTTPException(status_code=403, detail="Insufficient permissions.")
+    return current_user
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  PYDANTIC MODELS
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class LoginRequest(BaseModel):
+    email:    str
+    password: str
+
+    @field_validator("email")
+    @classmethod
+    def _clean_email(cls, v: str) -> str:
+        return sanitize_string(v, 254)
+
+    @field_validator("password")
+    @classmethod
+    def _clean_password(cls, v: str) -> str:
+        if not v or len(v) < 8:
+            raise ValueError("Password must be at least 8 characters.")
+        return v  # never sanitize / escape passwords — only validate length
+
+
+class RegisterRequest(BaseModel):
+    email:    str
+    name:     str
+    password: str
+    role:     str = "PO"
+
+    @field_validator("email")
+    @classmethod
+    def _clean_email(cls, v: str) -> str:
+        return sanitize_string(v, 254)
+
+    @field_validator("name")
+    @classmethod
+    def _clean_name(cls, v: str) -> str:
+        return sanitize_string(v, 120)
+
+    @field_validator("role")
+    @classmethod
+    def _clean_role(cls, v: str) -> str:
+        v = v.strip().upper()
+        if v not in ("PO", "RH", "ADMIN"):
+            raise ValueError("role must be PO, RH, or ADMIN.")
+        return v
+
+
+class CreateUserRequest(BaseModel):
+    name:     str
+    email:    str
+    role:     str
+    password: str = Field(default="ChangeMe123!")
+
+    @field_validator("email")
+    @classmethod
+    def _clean_email(cls, v: str) -> str:
+        return sanitize_string(v, 254)
+
+    @field_validator("name")
+    @classmethod
+    def _clean_name(cls, v: str) -> str:
+        return sanitize_string(v, 120)
+
+
+class ProjectJobIn(BaseModel):
+    title: str
+
+    @field_validator("title")
+    @classmethod
+    def _clean(cls, v: str) -> str:
+        return sanitize_string(v, 200)
+
+
+class CreateProjectRequest(BaseModel):
+    name:   str
+    client: str
+    status: str = "IN_PROGRESS"
+    poId:   str
+    jobs:   list[ProjectJobIn] = []
+
+    @field_validator("name", "client", "status", "poId")
+    @classmethod
+    def _clean(cls, v: str) -> str:
+        return sanitize_string(v, 300)
+
+
+class UpdatePORequest(BaseModel):
+    po_id: str
+
+    @field_validator("po_id")
+    @classmethod
+    def _clean(cls, v: str) -> str:
+        return sanitize_string(v, 254)
+
+
+class UpdateStatusRequest(BaseModel):
+    status: str
+
+    @field_validator("status")
+    @classmethod
+    def _clean(cls, v: str) -> str:
+        return sanitize_string(v, 50)
+
+
+class UpdateMatchStatusRequest(BaseModel):
+    status: str
+
+    @field_validator("status")
+    @classmethod
+    def _valid(cls, v: str) -> str:
+        v = v.strip().upper()
+        if v not in ("PENDING", "ACCEPTED", "REJECTED"):
+            raise ValueError("status must be PENDING, ACCEPTED, or REJECTED.")
+        return v
+
+
+class SwapRequest(BaseModel):
+    new_employee_id: str
+    old_match_id:    Optional[str] = None
+
+    @field_validator("new_employee_id")
+    @classmethod
+    def _clean(cls, v: str) -> str:
+        return sanitize_string(v, 254)
+
+
+class UpdateProjectRequest(BaseModel):
+    status: Optional[str] = None
+    poId:   Optional[str] = None
+
+    @field_validator("status")
+    @classmethod
+    def _clean_status(cls, v: Optional[str]) -> Optional[str]:
+        if v is None:
+            return v
+        return sanitize_string(v, 50)
+
+    @field_validator("poId")
+    @classmethod
+    def _clean_po(cls, v: Optional[str]) -> Optional[str]:
+        if v is None:
+            return v
+        return sanitize_string(v, 254)
+
+
+class ManualSwapRequest(BaseModel):
+    project_id:      str
+    job_id:          str
+    new_employee_id: str
+    old_match_id:    Optional[str] = None
+
+    @field_validator("project_id", "job_id", "new_employee_id")
+    @classmethod
+    def _clean(cls, v: str) -> str:
+        return sanitize_string(v, 254)
+
+
+class GenerateCVRequest(BaseModel):
+    employee_id: str
+    project_id:  Optional[str] = None
+    job_id:      Optional[str] = None
+    language:    str = "en"
+
+    @field_validator("employee_id")
+    @classmethod
+    def _clean_emp(cls, v: str) -> str:
+        return sanitize_string(v, 254)
+
+    @field_validator("language")
+    @classmethod
+    def _clean_lang(cls, v: str) -> str:
+        return sanitize_string(v, 5)
+
+
+class CandidateResponse(BaseModel):
+    employee_id: str
+    name: str
+    matching_score: float
+    matched_skills: list[dict] = []
+    missing_skills: list[dict] = []
+
+
+class ManualAssignRequest(BaseModel):
+    employee_id: str
+    replace_match_id: Optional[str] = None
+
+    @field_validator("employee_id")
+    @classmethod
+    def _clean(cls, v: str) -> str:
+        return sanitize_string(v, 254)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  HELPERS
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def _serialize(doc: Any) -> Any:
+    """Convert MongoDB documents to JSON-serialisable dicts."""
+    if doc is None:
+        return None
+    if isinstance(doc, dict):
+        return {k: _serialize(v) for k, v in doc.items() if k != "password_hash"}
+    if isinstance(doc, list):
+        return [_serialize(i) for i in doc]
+    # bson ObjectId → str
+    try:
+        from bson import ObjectId
+        if isinstance(doc, ObjectId):
+            return str(doc)
+    except ImportError:
+        pass
+    return doc
+
+
+def _not_found(resource: str) -> HTTPException:
+    return HTTPException(status_code=404, detail=f"{resource} not found.")
+
+
+def _serialize_employee(doc: dict) -> dict:
+    """Map internal MongoDB employee fields → frontend employee schema."""
+    if not doc:
+        return {}
+    doc = _serialize(doc)
+    projects_raw = doc.get("projects", [])
+    experiences = []
+    for i, p in enumerate(projects_raw):
+        sd = p.get("start_date") or ""
+        ed = p.get("end_date") or "Present"
+        period = f"{sd} - {ed}" if sd else ed
+        experiences.append({
+            "id":          p.get("project_id", f"exp_{i}"),
+            "title":       p.get("role", ""),
+            "company":     p.get("client", ""),
+            "period":      period,
+            "description": ", ".join(p.get("technologies", [])),
+        })
+    stored_stats = doc.get("stats", {})
+    return {
+        "id":          doc.get("_id") or doc.get("email", ""),
+        "name":        doc.get("name", ""),
+        "email":       doc.get("email", ""),
+        "about":       doc.get("current_role", ""),
+        "skills":      doc.get("skills", []),
+        "isAvailable": doc.get("available", True),
+        "avatarUrl":   doc.get("avatar_url"),
+        "experiences": experiences,
+        "stats": {
+            "technical":      stored_stats.get("technical", 50),
+            "communication":  stored_stats.get("communication", 50),
+            "leadership":     stored_stats.get("leadership", 50),
+            "problemSolving": stored_stats.get("problemSolving", 50),
+            "teamwork":       stored_stats.get("teamwork", 50),
+        },
+    }
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  HEALTH CHECK
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@app.get("/health", tags=["Health"])
+async def health():
+    return {"status": "ok"}
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  AUTH ROUTES
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@app.post("/api/v1/auth/login", tags=["Auth"])
+async def login(body: LoginRequest, request: Request):
+    """Authenticate with email + password, return JWT."""
+    email = validate_email_field(body.email)
+    check_nosql_injection({"email": email, "password": ""})
+    try:
+        result = _auth.login(email, body.password)
+        return result
+    except _auth.AuthError as exc:
+        raise HTTPException(status_code=401, detail=str(exc))
+
+
+@app.post("/api/v1/auth/logout", tags=["Auth"])
+async def logout(current_user: dict = Depends(_get_current_user)):
+    """Invalidate the current session (client must delete the token)."""
+    return {"message": "Logged out successfully."}
+
+
+@app.get("/api/v1/auth/me", tags=["Auth"])
+async def get_me(current_user: dict = Depends(_get_current_user)):
+    """Return the authenticated user's profile."""
+    user_id = current_user.get("sub")
+    doc = _db.db["users"].find_one({"_id": user_id}, {"password_hash": 0})
+    if not doc:
+        raise _not_found("User")
+    return _serialize(doc)
+
+
+@app.post("/api/v1/auth/register", tags=["Auth"], status_code=201)
+async def register(
+    body: RegisterRequest,
+    request: Request,
+    cf_turnstile_token: str = Header(default="", alias="CF-Turnstile-Token"),
+):
+    """Register a new user (requires Cloudflare Turnstile on the frontend form)."""
+    client_ip = request.headers.get("CF-Connecting-IP") or (request.client.host if request.client else None)
+    await verify_turnstile(cf_turnstile_token, client_ip)
+
+    email = validate_email_field(body.email)
+    check_nosql_injection({"email": email, "name": body.name})
+
+    try:
+        user = _auth.create_user(
+            email=email,
+            name=body.name,
+            password=body.password,
+            role=body.role,
+        )
+        return user
+    except (ValueError, _auth.AuthError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  USERS
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@app.get("/api/v1/users", tags=["Users"])
+async def list_users(current_user: dict = Depends(_require_admin)):
+    """Retrieve all system users (ADMIN only)."""
+    docs = list(_db.db["users"].find({}, {"password_hash": 0}))
+    return _serialize(docs)
+
+
+@app.post("/api/v1/users", tags=["Users"], status_code=201)
+async def create_user(
+    body: CreateUserRequest,
+    current_user: dict = Depends(_require_admin),
+):
+    """Create a new user (ADMIN only)."""
+    check_nosql_injection(body.model_dump())
+    email = validate_email_field(body.email)
+    try:
+        user = _auth.create_user(
+            email=email,
+            name=body.name,
+            password=body.password,
+            role=body.role.upper(),
+        )
+        return _serialize(user)
+    except (ValueError, _auth.AuthError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+
+@app.delete("/api/v1/users/{user_id}", tags=["Users"], status_code=204)
+async def delete_user(
+    user_id: str,
+    current_user: dict = Depends(_require_admin),
+):
+    """Soft-delete (deactivate) a user by email / ID (ADMIN only)."""
+    user_id = sanitize_string(user_id, 254)
+    try:
+        _auth.deactivate_user(user_id)
+    except _auth.AuthError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  EMPLOYEES
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@app.get("/api/v1/employees", tags=["Employees"])
+async def list_employees(
+    search:    Optional[str]  = None,
+    available: Optional[bool] = None,
+    current_user: dict = Depends(_get_current_user),
+):
+    """Retrieve all employees. Filter by search (name/email) or availability."""
+    query: dict = {}
+    if available is not None:
+        query["available"] = available
+    if search:
+        search = sanitize_string(search, 200)
+        query["$or"] = [
+            {"name":  {"$regex": search, "$options": "i"}},
+            {"email": {"$regex": search, "$options": "i"}},
+        ]
+    docs = list(_db.employees.find(query))
+    return [_serialize_employee(d) for d in docs]
+
+
+@app.get("/api/v1/employees/{employee_id}", tags=["Employees"])
+async def get_employee(
+    employee_id: str,
+    current_user: dict = Depends(_get_current_user),
+):
+    """Retrieve a single employee by ID (email)."""
+    employee_id = sanitize_string(employee_id, 254)
+    doc = _db.get_employee(employee_id)
+    if not doc:
+        raise _not_found("Employee")
+    return _serialize_employee(doc)
+
+
+@app.post("/api/v1/employees/upload-cv", tags=["Employees"], status_code=201)
+async def import_cv(
+    request: Request,
+    background_tasks: BackgroundTasks,
+    file:  UploadFile = File(...),
+    email: str        = Form(...),
+    cf_turnstile_token: str = Header(default="", alias="CF-Turnstile-Token"),
+    current_user: dict = Depends(_get_current_user),
+):
+    """
+    Upload a candidate CV (PDF) → AI parsing → new/updated Employee record.
+    After parsing, automatically re-triggers Smart Matching for all open projects
+    so this employee appears as a candidate wherever they are a good fit.
+    """
+    # Bot detection
+    client_ip = request.headers.get("CF-Connecting-IP") or (request.client.host if request.client else None)
+    await verify_turnstile(cf_turnstile_token, client_ip)
+
+    # Email sanitization
+    email = validate_email_field(email)
+
+    # PDF security validation — reads the upload into memory
+    pdf_bytes = await validate_pdf_upload(file)
+
+    # Write to a temp file so the existing pdf_parser can read it
+    with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as tmp:
+        tmp.write(pdf_bytes)
+        tmp_path = tmp.name
+
+    try:
+        # Lazy import to keep startup fast and avoid import errors when
+        # optional ML deps are not installed
+        from tools.pdf_parser import extract_text_from_pdf
+        from tools.olama import ask_llm
+
+        _CV_PROMPT = """
+You are a CV parser. Extract the following fields from the CV text and return ONLY valid JSON.
+
+{{
+  "name": "string",
+  "current_role": "string",
+  "skills": ["string"],
+  "education": [{{ "institution": "string", "degree": "string", "year": "string" }}],
+  "certifications": ["string"],
+  "projects": [
+    {{
+      "project_id": "string (slug)",
+      "client": "string",
+      "role": "string",
+      "start_date": "string",
+      "end_date": "string",
+      "technologies": ["string"]
+    }}
+  ]
+}}
+
+CV TEXT:
+{text}
+"""
+        import json, re
+
+        raw_text = extract_text_from_pdf(tmp_path)
+        if not raw_text.strip():
+            raise HTTPException(status_code=422, detail="PDF appears to be empty or unreadable.")
+
+        response = ask_llm(_CV_PROMPT.format(text=raw_text[:8000]))
+
+        # Strip markdown fences if present
+        cleaned = re.sub(r"```(?:json)?", "", response).strip().strip("`").strip()
+        parsed  = json.loads(cleaned)
+
+        is_new = not _db.employee_exists(email)
+        employee = _db.add_employee(
+            email          = email,
+            name           = sanitize_string(parsed.get("name", ""), 120),
+            current_role   = sanitize_string(parsed.get("current_role", ""), 200),
+            education      = parsed.get("education", []),
+            certifications = parsed.get("certifications", []),
+            skills         = [sanitize_string(s, 100) for s in parsed.get("skills", [])],
+            projects       = parsed.get("projects", []),
+            cv_filename    = file.filename,
+        )
+
+        # Auto re-match: trigger matching for all open projects so this
+        # employee appears as a candidate where they are a good fit.
+        open_project_ids = list({
+            j["project_id"] for j in _db.get_open_jobs()
+        })
+        for pid in open_project_ids:
+            background_tasks.add_task(_run_matching_pipeline, pid)
+
+        result = _serialize_employee(employee)
+        result["created" if is_new else "updated"] = True
+        return result
+
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.exception("CV import failed for %s", email)
+        raise HTTPException(status_code=500, detail=f"CV import failed: {exc}")
+    finally:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+
+
+@app.get("/api/v1/employees/{employee_id}/generate-cv", tags=["Employees"])
+async def generate_cv(
+    employee_id: str,
+    project_id:  Optional[str] = None,
+    job_id:      Optional[str] = None,
+    language:    str = "en",
+    current_user: dict = Depends(_get_current_user),
+):
+    """
+    Generate a tailored DOCX CV for an employee.
+    Optionally tailored to a specific project/job role.
+    """
+    employee_id = sanitize_string(employee_id, 254)
+    if project_id:
+        project_id = sanitize_string(project_id, 100)
+    if job_id:
+        job_id = sanitize_string(job_id, 100)
+    language = sanitize_string(language, 5)
+
+    if not _db.get_employee(employee_id):
+        raise _not_found("Employee")
+
+    try:
+        from cv_generation.cv_generation import generate_cv as _gen_cv
+
+        output_path = os.path.join(
+            tempfile.gettempdir(),
+            f"cv_{employee_id.replace('@','_').replace('.','_')}_{job_id or 'general'}.docx",
+        )
+        _gen_cv(
+            employee_id=employee_id,
+            job_id=job_id,
+            language=language,
+            output_path=output_path,
+        )
+
+        return FileResponse(
+            path=output_path,
+            media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            filename=os.path.basename(output_path),
+        )
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.exception("CV generation failed for %s", employee_id)
+        raise HTTPException(status_code=500, detail=f"CV generation failed: {exc}")
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  CV GENERATION (POST — frontend-facing)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@app.post("/api/v1/cv/generate", tags=["CV"])
+async def generate_cv_post(
+    body: GenerateCVRequest,
+    current_user: dict = Depends(_get_current_user),
+):
+    """
+    Generate a tailored DOCX CV via POST (frontend-facing).
+    Returns a binary .docx file download.
+    Optionally tailored to a specific project/job role when project_id + job_id are provided.
+    """
+    employee_id = sanitize_string(body.employee_id, 254)
+    job_id      = sanitize_string(body.job_id, 100) if body.job_id else None
+    language    = sanitize_string(body.language, 5)
+
+    if not _db.get_employee(employee_id):
+        raise _not_found("Employee")
+
+    try:
+        from cv_generation.cv_generation import generate_cv as _gen_cv
+
+        output_path = os.path.join(
+            tempfile.gettempdir(),
+            f"cv_{employee_id.replace('@','_').replace('.','_')}_{job_id or 'general'}.docx",
+        )
+        _gen_cv(
+            employee_id=employee_id,
+            job_id=job_id,
+            language=language,
+            output_path=output_path,
+        )
+        return FileResponse(
+            path=output_path,
+            media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            filename=os.path.basename(output_path),
+        )
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.exception("CV generation (POST) failed for %s", employee_id)
+        raise HTTPException(status_code=500, detail=f"CV generation failed: {exc}")
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  PROJECTS
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@app.get("/api/v1/projects", tags=["Projects"])
+async def list_projects(
+    po_id:  Optional[str] = None,
+    status: Optional[str] = None,
+    current_user: dict = Depends(_get_current_user),
+):
+    """Retrieve all projects (with nested jobs). Filter by po_id or status."""
+    query: dict = {}
+    if po_id:
+        query["po_id"] = sanitize_string(po_id, 254)
+    if status:
+        query["status"] = sanitize_string(status, 50).upper()
+    project_docs = list(_db.projects.find(query))
+    result = []
+    for proj in project_docs:
+        proj = _serialize(proj)
+        proj["jobs"] = _serialize(list(_db.jobs.find({"project_id": proj["_id"]})))
+        result.append(proj)
+    return result
+
+
+@app.get("/api/v1/projects/{project_id}", tags=["Projects"])
+async def get_project(
+    project_id: str,
+    current_user: dict = Depends(_get_current_user),
+):
+    """Retrieve a single project with its job roles."""
+    project_id = sanitize_string(project_id, 100)
+    doc = _db.get_project(project_id)
+    if not doc:
+        raise _not_found("Project")
+    result = _serialize(doc)
+    result["jobs"] = _serialize(list(_db.jobs.find({"project_id": project_id})))
+    return result
+
+
+@app.post("/api/v1/projects", tags=["Projects"], status_code=201)
+async def create_project(
+    body: CreateProjectRequest,
+    background_tasks: BackgroundTasks,
+    current_user: dict = Depends(_require_po_or_admin),
+):
+    """
+    Create a new project and trigger Smart Matching in the background.
+    Returns the created project immediately; matching runs asynchronously.
+    """
+    check_nosql_injection(body.model_dump())
+
+    import re as _re, uuid
+
+    project_name = body.name
+    slug         = _re.sub(r"[^a-z0-9]+", "_", project_name.lower()).strip("_")
+    project_id   = f"proj_{slug}_{uuid.uuid4().hex[:6]}"
+
+    # Upsert project (without jobs first)
+    _db.upsert_project(
+        project_id           = project_id,
+        name                 = project_name,
+        client_name          = body.client,
+        description          = "",
+        functional_needs     = [],
+        non_functional_needs = [],
+        technology_stack     = [],
+        job_ids              = [],
+        po_id                = body.poId,
+    )
+
+    # Create each job and link to project
+    job_ids = []
+    for idx, job_in in enumerate(body.jobs):
+        j_slug  = _re.sub(r"[^a-z0-9]+", "_", job_in.title.lower()).strip("_")
+        job_id  = f"{project_id}_{j_slug}_{idx}"
+        _db.upsert_job(
+            job_id                    = job_id,
+            project_id                = project_id,
+            title                     = job_in.title,
+            description               = "",
+            headcount                 = 1,
+            required_stack            = [],
+            responsibilities          = [],
+            seniority                 = "mid",
+            job_type                  = "full-time",
+            estimated_duration_months = 6,
+        )
+        _db.add_job_to_project(project_id, job_id)
+        job_ids.append(job_id)
+
+    # Update project status field
+    _db.projects.update_one(
+        {"_id": project_id},
+        {"$set": {"status": body.status}},
+    )
+
+    # Trigger smart matching asynchronously
+    background_tasks.add_task(_run_matching_pipeline, project_id)
+
+    project = _db.get_project(project_id)
+    result  = _serialize(project)
+    result["jobs"] = _serialize(list(_db.jobs.find({"project_id": project_id})))
+    return result
+
+
+def _run_matching_pipeline(project_id: str) -> None:
+    """Background task: run the full matching pipeline for a project."""
+    try:
+        logger.info("[Matching] Starting pipeline for project '%s'", project_id)
+        open_jobs_docs = _db.get_open_jobs(project_id)
+        if not open_jobs_docs:
+            logger.warning("[Matching] No open jobs found for project '%s'", project_id)
+            return
+
+        jobs_input = {
+            doc["_id"]: {
+                "description": doc.get("description", doc.get("title", "")),
+                "posts":       doc.get("remaining", 1),
+            }
+            for doc in open_jobs_docs
+        }
+
+        available_employees = list(_db.employees.find({"available": True}, {"_id": 1}))
+        available_emails    = {e["_id"] for e in available_employees}
+
+        # Build exclusion map from already-rejected assignments
+        exclusion_map: dict[str, set] = {jid: set() for jid in jobs_input}
+        rejected_assignments = list(_db.assignments.find({
+            "project_id": project_id,
+            "status":     "rejected",
+        }))
+        for asgn in rejected_assignments:
+            jid = asgn.get("job_id")
+            eid = asgn.get("employee_id")
+            if jid and eid:
+                exclusion_map.setdefault(jid, set()).add(eid)
+
+        from matching_pipeline.pipeline import run_pipeline
+        run_pipeline(
+            jobs             = jobs_input,
+            available_emails = available_emails,
+            exclusion_map    = exclusion_map,
+            project_id       = project_id,
+        )
+        _clear_session(project_id)  # Refresh cache after pipeline run
+        logger.info("[Matching] Pipeline completed for project '%s'", project_id)
+    except Exception as exc:
+        logger.error("[Matching] Pipeline failed for project '%s': %s", project_id, exc)
+
+
+@app.patch("/api/v1/projects/{project_id}", tags=["Projects"])
+async def update_project(
+    project_id: str,
+    body: UpdateProjectRequest,
+    current_user: dict = Depends(_require_po_or_admin),
+):
+    """
+    Unified project update endpoint.
+    - status: PO or ADMIN can update (IN_PROGRESS | FINISHED | CANCELED)
+    - poId:   ADMIN only — reassign Product Owner
+    """
+    project_id = sanitize_string(project_id, 100)
+    updates: dict = {}
+
+    if body.status:
+        valid_statuses = {"IN_PROGRESS", "FINISHED", "CANCELED"}
+        status = body.status.upper()
+        if status not in valid_statuses:
+            raise HTTPException(status_code=400, detail=f"status must be one of: {valid_statuses}")
+        updates["status"] = status
+
+    if body.poId:
+        if current_user.get("role") not in ("ADMIN",) and not current_user.get("is_sys_admin"):
+            raise HTTPException(status_code=403, detail="Only ADMIN can reassign Product Owner.")
+        po_id = validate_email_field(body.poId)
+        po_user = _db.db["users"].find_one(
+            {"_id": po_id, "role": "PO", "active": {"$ne": False}}, {"_id": 1}
+        )
+        if not po_user:
+            raise HTTPException(status_code=400, detail=f"No active PO found with id '{po_id}'.")
+        updates["po_id"] = po_id
+
+    if not updates:
+        raise HTTPException(status_code=400, detail="Provide at least one of: status, poId.")
+
+    result = _db.projects.update_one({"_id": project_id}, {"$set": updates})
+    if result.matched_count == 0:
+        raise _not_found("Project")
+
+    doc = _db.get_project(project_id)
+    out = _serialize(doc)
+    out["jobs"] = _serialize(list(_db.jobs.find({"project_id": project_id})))
+    return out
+
+
+@app.patch("/api/v1/projects/{project_id}/status", tags=["Projects"])
+async def update_project_status(
+    project_id: str,
+    body: UpdateStatusRequest,
+    current_user: dict = Depends(_require_po_or_admin),
+):
+    """Update a project's status."""
+    project_id = sanitize_string(project_id, 100)
+    valid_statuses = {"IN_PROGRESS", "FINISHED", "CANCELED"}
+    status = body.status.upper()
+    if status not in valid_statuses:
+        raise HTTPException(status_code=400, detail=f"status must be one of: {valid_statuses}")
+
+    result = _db.projects.update_one(
+        {"_id": project_id},
+        {"$set": {"status": status}},
+    )
+    if result.matched_count == 0:
+        raise _not_found("Project")
+
+    return _serialize(_db.get_project(project_id))
+
+
+@app.patch("/api/v1/projects/{project_id}/po", tags=["Projects"])
+async def update_project_po(
+    project_id: str,
+    body: UpdatePORequest,
+    current_user: dict = Depends(_require_admin),
+):
+    """Reassign a project to a different Product Owner (ADMIN only)."""
+    project_id = sanitize_string(project_id, 100)
+    po_id = validate_email_field(body.po_id)
+
+    po_user = _db.db["users"].find_one({"_id": po_id, "role": "PO", "active": {"$ne": False}}, {"_id": 1})
+    if not po_user:
+        raise HTTPException(status_code=400, detail=f"No active PO user found with id '{po_id}'.")
+
+    result = _db.projects.update_one(
+        {"_id": project_id},
+        {"$set": {"po_id": po_id}},
+    )
+    if result.matched_count == 0:
+        raise _not_found("Project")
+
+    return _serialize(_db.get_project(project_id))
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  MATCHES / ASSIGNMENTS
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def _assignment_to_match(doc: dict) -> dict:
+    """Map internal assignment fields → frontend match schema."""
+    if not doc:
+        return {}
+    return {
+        "id":          doc.get("_id", ""),
+        "projectId":   doc.get("project_id", ""),
+        "jobId":       doc.get("job_id", ""),
+        "employeeId":  doc.get("employee_id", ""),
+        "status":      (doc.get("status", "pending")).upper(),
+        "matchReason": doc.get("notes", ""),
+        "matchScore":  doc.get("score", 0),
+    }
+
+
+@app.get("/api/v1/matches", tags=["Matches"])
+async def get_matches(
+    project_id: str,
+    job_id:     Optional[str] = None,
+    status:     Optional[str] = None,
+    current_user: dict = Depends(_get_current_user),
+):
+    """
+    Retrieve matches for a project, sorted by matchScore descending.
+    Optionally filter by job_id or status (PENDING|ACCEPTED|REJECTED).
+    """
+    project_id = sanitize_string(project_id, 100)
+    query: dict = {"project_id": project_id}
+    if job_id:
+        query["job_id"] = sanitize_string(job_id, 100)
+    if status:
+        query["status"] = sanitize_string(status, 50).lower()
+    docs = list(_db.assignments.find(query))
+    for doc in docs:
+        doc["_id"] = str(doc["_id"])
+    result = [_assignment_to_match(d) for d in docs]
+    result.sort(key=lambda x: x.get("matchScore", 0), reverse=True)
+    return result
+
+
+@app.get("/api/v1/projects/{project_id}/matches", tags=["Matches"])
+async def get_project_matches(
+    project_id: str,
+    current_user: dict = Depends(_get_current_user),
+):
+    """Retrieve all matches for a project (nested path alias)."""
+    project_id = sanitize_string(project_id, 100)
+    docs = list(_db.assignments.find({"project_id": project_id}))
+    for doc in docs:
+        doc["_id"] = str(doc["_id"])
+    result = [_assignment_to_match(d) for d in docs]
+    result.sort(key=lambda x: x.get("matchScore", 0), reverse=True)
+    return result
+
+
+@app.patch("/api/v1/matches/{match_id}/status", tags=["Matches"])
+@app.patch("/api/v1/matches/{match_id}", tags=["Matches"], include_in_schema=False)
+async def update_match_status(
+    match_id: str,
+    body: UpdateMatchStatusRequest,
+    background_tasks: BackgroundTasks,
+    current_user: dict = Depends(_require_po_or_admin),
+):
+    """
+    Accept or reject a pending match.
+
+    ACCEPT side-effects (dynamic availability cascade):
+      1. Mark assignment accepted.
+      2. Mark employee unavailable.
+      3. Cancel all other PENDING assignments for this employee across ALL projects.
+      4. For each affected project, trigger background re-matching to auto-suggest replacements.
+
+    REJECT side-effects:
+      Employee stays available; no job counters change.
+    """
+    match_id = sanitize_string(match_id, 100)
+    status   = body.status.upper()
+
+    try:
+        if status == "ACCEPTED":
+            # Capture other pending assignments BEFORE accept deletes them
+            assignment = _db.get_assignment(match_id)
+            if not assignment:
+                raise _not_found("Match")
+            employee_id = assignment["employee_id"]
+            other_pending = list(_db.assignments.find({
+                "employee_id": employee_id,
+                "status":      "pending",
+            }))
+            other_project_ids = {
+                str(a["_id"]): a["project_id"]
+                for a in other_pending
+                if str(a["_id"]) != match_id
+            }
+
+            doc = _db.accept_assignment(match_id)
+
+            # Trigger re-matching for every project that lost this candidate
+            for pid in set(other_project_ids.values()):
+                background_tasks.add_task(_run_matching_pipeline, pid)
+                logger.info(
+                    "[Cascade] Re-matching project '%s' — employee '%s' accepted elsewhere",
+                    pid, employee_id,
+                )
+
+        elif status == "REJECTED":
+            doc = _db.reject_assignment(match_id)
+        else:
+            raise HTTPException(
+                status_code=400,
+                detail="Only ACCEPTED or REJECTED transitions are supported here.",
+            )
+        return _assignment_to_match(_serialize(doc))
+    except (ValueError, HTTPException):
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+@app.post("/api/v1/matches/{match_id}/reject-and-suggest", tags=["Matches"])
+@app.post("/api/v1/matches/{match_id}/reject-next", tags=["Matches"], include_in_schema=False)
+async def reject_and_find_next(
+    match_id: str,
+    background_tasks: BackgroundTasks,
+    current_user: dict = Depends(_require_po_or_admin),
+):
+    """
+    Reject the current PENDING match.
+    Immediately checks the DB for the next best ranked candidate for the same job.
+    Also triggers background re-matching to refresh the pool.
+
+    Response includes `new_suggestion` (match object or null).
+    """
+    match_id = sanitize_string(match_id, 100)
+
+    assignment = _db.get_assignment(match_id)
+    if not assignment:
+        raise _not_found("Match")
+
+    job_id     = assignment["job_id"]
+    project_id = assignment["project_id"]
+
+    try:
+        _db.reject_assignment(match_id, reason="Rejected by user — finding next candidate.")
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+    # Check DB for an existing next-best PENDING match for the same job
+    next_docs = list(_db.assignments.find({
+        "job_id":    job_id,
+        "project_id": project_id,
+        "status":    "pending",
+    }).sort("score", -1).limit(1))
+    new_suggestion = None
+    if next_docs:
+        d = next_docs[0]
+        d["_id"] = str(d["_id"])
+        new_suggestion = _assignment_to_match(d)
+
+    # Always re-trigger matching in background for fresh candidates
+    background_tasks.add_task(_run_matching_pipeline, project_id)
+
+    return {
+        "rejected_match_id": match_id,
+        "new_suggestion":    new_suggestion,
+        "message": (
+            "Next candidate returned from pool."
+            if new_suggestion
+            else "No immediate candidate available. Matching running in background."
+        ),
+    }
+
+
+@app.post("/api/v1/matches/{match_id}/unassign", tags=["Matches"])
+async def unassign_employee(
+    match_id: str,
+    background_tasks: BackgroundTasks,
+    current_user: dict = Depends(_require_po_or_admin),
+):
+    """
+    Unassign an accepted employee: restore their availability and find a replacement.
+    Returns `new_suggestion` if a candidate already exists in the pool for that job.
+    """
+    match_id = sanitize_string(match_id, 100)
+
+    assignment = _db.get_assignment(match_id)
+    if not assignment:
+        raise _not_found("Match")
+
+    job_id     = assignment["job_id"]
+    project_id = assignment["project_id"]
+
+    try:
+        _db.unassign_employee(match_id, reason="Manually unassigned via API.")
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+    # Check for an existing pending candidate for the same job
+    next_docs = list(_db.assignments.find({
+        "job_id":     job_id,
+        "project_id": project_id,
+        "status":     "pending",
+    }).sort("score", -1).limit(1))
+    new_suggestion = None
+    if next_docs:
+        nd = next_docs[0]
+        nd["_id"] = str(nd["_id"])
+        new_suggestion = _assignment_to_match(nd)
+
+    # Re-trigger matching for the now-vacant job
+    background_tasks.add_task(_run_matching_pipeline, project_id)
+
+    return {
+        "unassigned_match_id": match_id,
+        "new_suggestion":      new_suggestion,
+    }
+
+
+@app.post("/api/v1/matches/manual-swap", tags=["Matches"], status_code=201)
+async def manual_swap(
+    body: ManualSwapRequest,
+    current_user: dict = Depends(_require_po_or_admin),
+):
+    """
+    Frontend-facing manual swap endpoint.
+    Reject the old match (if provided) → create a new PENDING assignment for the chosen employee.
+    Returns { old_match_rejected, new_match }.
+    """
+    project_id      = sanitize_string(body.project_id, 100)
+    job_id          = sanitize_string(body.job_id, 100)
+    new_employee_id = sanitize_string(body.new_employee_id, 254)
+    check_nosql_injection({"new_employee_id": new_employee_id})
+
+    old_match_rejected = False
+    if body.old_match_id:
+        old_match_id = sanitize_string(body.old_match_id, 100)
+        old_asgn = _db.get_assignment(old_match_id)
+        if old_asgn:
+            try:
+                if old_asgn["status"] == "accepted":
+                    _db.unassign_employee(old_match_id, reason="Replaced via manual swap.")
+                elif old_asgn["status"] == "pending":
+                    _db.reject_assignment(old_match_id, reason="Replaced via manual swap.")
+                old_match_rejected = True
+            except ValueError:
+                pass
+
+    try:
+        new_asgn = _db.create_assignment(
+            employee_id = new_employee_id,
+            project_id  = project_id,
+            job_id      = job_id,
+            assigned_by = current_user.get("sub", "system"),
+            notes       = "Manually suggested and swapped by Product Owner.",
+        )
+        return {
+            "old_match_rejected": old_match_rejected,
+            "new_match":          _assignment_to_match(_serialize(new_asgn)),
+        }
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+
+@app.post("/api/v1/projects/{project_id}/jobs/{job_id}/swap", tags=["Matches"], status_code=201)
+async def swap_employee(
+    project_id: str,
+    job_id:     str,
+    body: SwapRequest,
+    current_user: dict = Depends(_require_po_or_admin),
+):
+    """
+    Manually override the system suggestion:
+      1. Reject the old match (if provided).
+      2. Create a new PENDING assignment for the chosen employee.
+    """
+    project_id      = sanitize_string(project_id, 100)
+    job_id          = sanitize_string(job_id, 100)
+    new_employee_id = sanitize_string(body.new_employee_id, 254)
+    check_nosql_injection({"new_employee_id": new_employee_id})
+
+    # Reject old match if provided
+    if body.old_match_id:
+        old_match_id = sanitize_string(body.old_match_id, 100)
+        old_asgn = _db.get_assignment(old_match_id)
+        if old_asgn:
+            try:
+                if old_asgn["status"] == "accepted":
+                    _db.unassign_employee(old_match_id, reason="Replaced via manual swap.")
+                elif old_asgn["status"] == "pending":
+                    _db.reject_assignment(old_match_id, reason="Replaced via manual swap.")
+            except ValueError:
+                pass  # already in terminal state
+
+    # Create new pending assignment
+    try:
+        new_asgn = _db.create_assignment(
+            employee_id = new_employee_id,
+            project_id  = project_id,
+            job_id      = job_id,
+            assigned_by = current_user.get("sub", "system"),
+            notes       = "Manually assigned via swap.",
+        )
+        try:
+            explanation = explain_assignment(job_id, new_employee_id, project_id, 0.75)
+            _db.assignments.update_one(
+                {"_id": new_asgn["_id"]},
+                {"$set": {"explanation": explanation}}
+            )
+            result = _assignment_to_match(_serialize(new_asgn))
+            result["explanation"] = explanation
+        except Exception:
+            result = _assignment_to_match(_serialize(new_asgn))
+        return result
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  PROJECT PDF WORKFLOWS (PO workflow)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@app.post("/api/v1/projects/parse-pdf", tags=["Projects"])
+async def parse_project_pdf_only(
+    request: Request,
+    file: UploadFile = File(...),
+    cf_turnstile_token: str = Header(default="", alias="CF-Turnstile-Token"),
+    current_user: dict = Depends(_require_po_or_admin),
+):
+    """
+    Step 1 of the two-step PDF upload flow.
+    Upload a PO report PDF → AI extracts structured data → returns preview.
+    Does NOT write to the database. Call POST /api/v1/projects next to create.
+    """
+    client_ip = request.headers.get("CF-Connecting-IP") or (request.client.host if request.client else None)
+    await verify_turnstile(cf_turnstile_token, client_ip)
+
+    pdf_bytes = await validate_pdf_upload(file)
+
+    with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as tmp:
+        tmp.write(pdf_bytes)
+        tmp_path = tmp.name
+
+    try:
+        from po_parser.project_parser import parse_project_pdf
+        data = parse_project_pdf(tmp_path)
+        project_meta = data.get("project", {})
+        jobs_raw     = data.get("jobs", [])
+        return {
+            "name":        project_meta.get("name", ""),
+            "client":      project_meta.get("client", ""),
+            "description": project_meta.get("description", ""),
+            "jobs": [
+                j.get("title", str(j)) if isinstance(j, dict) else str(j)
+                for j in jobs_raw
+            ],
+        }
+    except Exception as exc:
+        logger.exception("PDF parse-only failed")
+        raise HTTPException(status_code=500, detail=f"PDF parsing failed: {exc}")
+    finally:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+
+
+@app.post("/api/v1/projects/ingest-pdf", tags=["Projects"], status_code=201)
+async def ingest_project_pdf(
+    request: Request,
+    file:  UploadFile = File(...),
+    po_id: str        = Form(...),
+    cf_turnstile_token: str = Header(default="", alias="CF-Turnstile-Token"),
+    background_tasks: BackgroundTasks = BackgroundTasks(),
+    current_user: dict = Depends(_require_po_or_admin),
+):
+    """
+    Upload a PO project report PDF → AI parses it → project + jobs created →
+    smart matching triggered automatically.
+    """
+    client_ip = request.headers.get("CF-Connecting-IP") or (request.client.host if request.client else None)
+    await verify_turnstile(cf_turnstile_token, client_ip)
+
+    po_id     = sanitize_string(po_id, 254)
+    pdf_bytes = await validate_pdf_upload(file)
+
+    with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as tmp:
+        tmp.write(pdf_bytes)
+        tmp_path = tmp.name
+
+    try:
+        from po_parser.ingest_project import ingest_project_pdf as _ingest
+        summary = _ingest(tmp_path, po_id=po_id)
+        # Trigger matching for the new project
+        background_tasks.add_task(_run_matching_pipeline, summary["project_id"])
+        return summary
+    except Exception as exc:
+        logger.exception("Project PDF ingest failed")
+        raise HTTPException(status_code=500, detail=f"Project ingest failed: {exc}")
+    finally:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  SEARCH & MANUAL ASSIGN
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@app.get("/api/v1/projects/{project_id}/jobs/{job_id}/candidates", tags=["Matches"])
+async def search_job_candidates(
+    project_id: str,
+    job_id: str,
+    limit: int = 50,
+    current_user: dict = Depends(_get_current_user),
+):
+    """Search available employees for a job with matching scores."""
+    project_id = sanitize_string(project_id, 100)
+    job_id = sanitize_string(job_id, 100)
+
+    try:
+        session = _get_session(project_id)
+        search_svc = SearchService(
+            session.job_matrix, session.profile_matrix, session.job_ids, session.emails,
+            session.current_weights, session.index, _db
+        )
+        results = search_svc.search_employees_for_job(job_id, project_id, limit)
+        return results
+    except Exception as exc:
+        logger.exception("Search candidates failed")
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+@app.post(
+    "/api/v1/projects/{project_id}/jobs/{job_id}/assign",
+    tags=["Matches"],
+    status_code=201,
+)
+async def manual_assign_candidate(
+    project_id: str,
+    job_id: str,
+    body: ManualAssignRequest,
+    current_user: dict = Depends(_require_po_or_admin),
+):
+    """Manually assign employee with auto-generated explanation."""
+    project_id = sanitize_string(project_id, 100)
+    job_id = sanitize_string(job_id, 100)
+    emp_id = sanitize_string(body.employee_id, 254)
+    check_nosql_injection({"employee_id": emp_id})
+
+    try:
+        if body.replace_match_id:
+            old_id = sanitize_string(body.replace_match_id, 100)
+            old = _db.get_assignment(old_id)
+            if old:
+                try:
+                    if old["status"] == "accepted":
+                        _db.unassign_employee(old_id, reason="Replaced")
+                    else:
+                        _db.reject_assignment(old_id, reason="Replaced")
+                except Exception:
+                    pass
+
+        new_asgn = _db.create_assignment(
+            employee_id=emp_id,
+            project_id=project_id,
+            job_id=job_id,
+            assigned_by=current_user.get("sub", "system"),
+            notes="Manually assigned via UI",
+        )
+
+        explanation = explain_assignment(job_id, emp_id, project_id, 0.75)
+        _db.assignments.update_one(
+            {"_id": new_asgn["_id"]},
+            {"$set": {"explanation": explanation}}
+        )
+
+        result = _assignment_to_match(_serialize(new_asgn))
+        result["explanation"] = explanation
+        return result
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    except Exception as exc:
+        logger.exception("Manual assign failed")
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+@app.post(
+    "/api/v1/projects/{project_id}/jobs/{job_id}/candidates/{employee_id}/explain",
+    tags=["Matches"],
+)
+async def explain_candidate_fit(
+    project_id: str,
+    job_id: str,
+    employee_id: str,
+    current_user: dict = Depends(_get_current_user),
+):
+    """Generate explanation for employee-job fit."""
+    project_id = sanitize_string(project_id, 100)
+    job_id = sanitize_string(job_id, 100)
+    employee_id = sanitize_string(employee_id, 254)
+
+    try:
+        explanation = explain_assignment(job_id, employee_id, project_id)
+        return {"explanation": explanation, "job_id": job_id, "employee_id": employee_id}
+    except Exception as exc:
+        logger.exception("Explain candidate fit failed")
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+@app.post(
+    "/api/v1/assignments/{assignment_id}/reject-with-suggestion",
+    tags=["Matches"],
+)
+async def reject_assignment_with_suggestion(
+    assignment_id: str,
+    current_user: dict = Depends(_require_po_or_admin),
+):
+    """Reject assignment and suggest best next candidate."""
+    assignment_id = sanitize_string(assignment_id, 100)
+
+    try:
+        asgn = _db.get_assignment(assignment_id)
+        if not asgn:
+            raise HTTPException(status_code=404, detail="Assignment not found")
+
+        job_id = asgn.get("job_id")
+        project_id = asgn.get("project_id")
+        rejected_emp = asgn.get("employee_id")
+
+        _db.reject_assignment(assignment_id, reason="Rejected by user")
+
+        session = _get_session(project_id)
+        search_svc = SearchService(
+            session.job_matrix, session.profile_matrix, session.job_ids, session.emails,
+            session.current_weights, session.index, _db
+        )
+
+        next_candidate = search_svc.get_next_best_candidate(job_id, project_id, exclude_employee=rejected_emp)
+
+        if not next_candidate:
+            return {
+                "message": "Assignment rejected",
+                "assignment_id": assignment_id,
+                "suggestion": None,
+            }
+
+        explanation = explain_assignment(job_id, next_candidate["employee_id"], project_id, next_candidate["matching_score"])
+        next_candidate["explanation"] = explanation
+
+        return {
+            "message": "Assignment rejected",
+            "assignment_id": assignment_id,
+            "suggestion": next_candidate,
+        }
+    except HTTPException:
+        raise
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    except Exception as exc:
+        logger.exception("Reject with suggestion failed")
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  GLOBAL EXCEPTION HANDLER
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@app.exception_handler(Exception)
+async def _global_handler(request: Request, exc: Exception):
+    logger.exception("Unhandled exception on %s", request.url)
+    return JSONResponse(
+        status_code=500,
+        content={"detail": "An internal server error occurred."},
+    )
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  ENTRY POINT
+# ═══════════════════════════════════════════════════════════════════════════════
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(
+        "main:app",
+        host    = os.getenv("HOST", "0.0.0.0"),
+        port    = int(os.getenv("PORT", "8000")),
+        reload  = os.getenv("RELOAD", "true").lower() == "true",
+        workers = int(os.getenv("WORKERS", "1")),
+    )
